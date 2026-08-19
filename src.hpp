@@ -45,46 +45,45 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     Matrix *S = matrix_memory_allocator.Allocate("S");
     gpu_sim.MatMul(current_query, kcat, S);
 
-    // Determine the number of rows from the real query matrix (its shape is
-    // already valid; S is only populated when Run() executes MatMul).
+    // r is taken from the real query matrix (valid before Run executes MatMul).
     size_t r = current_query->GetRowNum();
 
-    // current_query is not needed anymore -> release to save SRAM.
+    // current_query is no longer needed -> release to save SRAM.
     gpu_sim.ReleaseMatrix(current_query);
 
-    // Transpose kcat back to [r, d] so it can be reused for accumulation next
-    // round. (MatMul only reads kcat, so this is safe.)
+    // Transpose kcat back to [r, d] so it can be reused for accumulation.
     gpu_sim.Transpose(kcat, kInSharedMemory);
 
-    // ---- Row-wise softmax of S, compute output row by row. ----
-    // out[j] = (exp(S[j]) / sum(exp(S[j]))) @ vcat
-    Matrix *out = nullptr;
+    // ---- Row-wise softmax of S, accumulate into the small sm matrix [r, r]. ----
+    Matrix *sm = nullptr;
     for (size_t j = 0; j < r; ++j) {
       Matrix *row = matrix_memory_allocator.Allocate("row");
-      gpu_sim.GetRow(S, j, row, kInSharedMemory);          // [1, r]
+      gpu_sim.GetRow(S, j, row, kInSharedMemory);           // [1, r]
       Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
-      gpu_sim.MatExp(row, row_exp);                        // [1, r]
+      gpu_sim.MatExp(row, row_exp);                         // [1, r]
       Matrix *sval = matrix_memory_allocator.Allocate("sum");
-      gpu_sim.Sum(row_exp, sval);                          // [1, 1]
-      Matrix *w = matrix_memory_allocator.Allocate("w");
-      gpu_sim.MatMul(row_exp, vcat, w);                    // [1, d]
-      Matrix *outj = matrix_memory_allocator.Allocate("outj");
-      gpu_sim.MatDiv(w, sval, outj);                       // [1, d]
-      if (out == nullptr) {
-        out = outj;
+      gpu_sim.Sum(row_exp, sval);                           // [1, 1]
+      Matrix *norm = matrix_memory_allocator.Allocate("norm");
+      gpu_sim.MatDiv(row_exp, sval, norm);                  // [1, r] (one softmax row)
+      if (sm == nullptr) {
+        sm = norm;
       } else {
-        Matrix *newout = matrix_memory_allocator.Allocate("out");
-        gpu_sim.Concat(out, outj, newout, 0, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(out);
-        gpu_sim.ReleaseMatrix(outj);
-        out = newout;
+        Matrix *newsm = matrix_memory_allocator.Allocate("sm");
+        gpu_sim.Concat(sm, norm, newsm, 0, kInSharedMemory);
+        gpu_sim.ReleaseMatrix(sm);
+        gpu_sim.ReleaseMatrix(norm);
+        sm = newsm;
       }
       gpu_sim.ReleaseMatrix(row);
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(sval);
-      gpu_sim.ReleaseMatrix(w);
     }
     gpu_sim.ReleaseMatrix(S);
+
+    // ---- out = softmax(S) @ Vcat  (shape [r, d]) ----
+    Matrix *out = matrix_memory_allocator.Allocate("out");
+    gpu_sim.MatMul(sm, vcat, out);
+    gpu_sim.ReleaseMatrix(sm);
 
     // Result must be in GPU HBM before commit.
     gpu_sim.MoveMatrixToGpuHbm(out);
